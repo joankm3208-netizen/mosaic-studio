@@ -12,10 +12,12 @@ icon.filename = %(source.dir)s/icon.png
 presplash.filename = %(source.dir)s/presplash.png
 android.presplash_color = #0E1015
 android.permissions = READ_MEDIA_IMAGES,READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE
-android.api = 34
+android.api = 33
 android.minapi = 24
+android.ndk = 25b
 android.archs = arm64-v8a
 android.accept_sdk_license = True
+p4a.branch = v2024.01.21
 
 [buildozer]
 log_level = 2

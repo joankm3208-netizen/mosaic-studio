@@ -5,7 +5,7 @@ package.domain = org.mosaic
 source.dir = .
 source.include_exts = py,png
 version = 9.0
-requirements = python3,kivy==2.3.0,pillow,numpy,pyjnius,android
+requirements = python3,kivy==2.3.0,pillow,pyjnius,android
 orientation = portrait
 fullscreen = 0
 icon.filename = %(source.dir)s/icon.png

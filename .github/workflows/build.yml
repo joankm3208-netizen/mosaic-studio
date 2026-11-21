@@ -28,7 +28,7 @@ jobs:
           grep -n -i -E "error|failed|exception|not found|no such" build.log | tail -n 40
           echo "===== ULTIMAS 60 LINEAS ====="
           tail -n 60 build.log
-           - name: Subir APK
+          - name: Subir APK
         uses: actions/upload-artifact@v4
         with:
           name: MosaicStudio-APK

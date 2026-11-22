@@ -1,5 +1,6 @@
 """Mosaic Studio - UI moderna (Kivy). Motor de render en engine.py (solo PIL)."""
 import io
+import math
 import os
 import sys
 import uuid
@@ -32,6 +33,8 @@ from kivy.uix.scatter import Scatter
 from kivy.uix.screenmanager import Screen, ScreenManager, SlideTransition
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.slider import Slider
+from kivy.uix.widget import Widget
+from kivy.properties import NumericProperty
 from PIL import Image as PILImage, ImageOps
 
 import engine
@@ -72,6 +75,12 @@ def start_dir():
 EXPORT_DIR = os.path.join(BASE, "Pictures", "MosaicStudio")
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOGO = os.path.join(HERE, "icon.png")
+BRAND = os.path.join(HERE, "phaizerx.png")
+try:
+    _bw, _bh = PILImage.open(BRAND).size
+    BRAND_ASPECT = _bw / _bh
+except Exception:
+    BRAND_ASPECT = 2.2
 
 
 def unique_name():
@@ -88,6 +97,91 @@ def media_scan(path):
         scanner.scanFile(activity, [path], None, None)
     except Exception:
         pass
+
+
+def save_to_gallery(img, name, fmt):
+    """Guarda en la galería del teléfono (MediaStore en Android 10+). Devuelve (ok, mensaje)."""
+    fname = f"{name}.{fmt}"
+    mime = "image/jpeg" if fmt == "jpg" else "image/png"
+    pil_fmt = "JPEG" if fmt == "jpg" else "PNG"
+    kw = dict(quality=95, subsampling=0) if fmt == "jpg" else {}
+    if IS_ANDROID:
+        try:
+            from jnius import autoclass
+            if autoclass("android.os.Build$VERSION").SDK_INT >= 29:
+                activity = autoclass("org.kivy.android.PythonActivity").mActivity
+                values = autoclass("android.content.ContentValues")()
+                values.put("_display_name", fname)
+                values.put("mime_type", mime)
+                values.put("relative_path", "Pictures/MosaicStudio")
+                media = autoclass("android.provider.MediaStore$Images$Media")
+                resolver = activity.getContentResolver()
+                uri = resolver.insert(media.EXTERNAL_CONTENT_URI, values)
+                if uri is None:
+                    raise RuntimeError("MediaStore no devolvió ruta")
+                fd = resolver.openFileDescriptor(uri, "w").detachFd()
+                with os.fdopen(fd, "wb") as f:
+                    img.save(f, pil_fmt, **kw)
+                return True, "Guardado en la galería (Pictures/MosaicStudio)"
+        except Exception:
+            pass  # si falla, se intenta por ruta de archivo
+    try:
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+        path = os.path.join(EXPORT_DIR, fname)
+        img.save(path, pil_fmt, **kw)
+        media_scan(path)
+        return True, "Guardado en Pictures/MosaicStudio"
+    except Exception as e:
+        return False, f"No se pudo guardar: {str(e)[:70]}"
+
+
+class UriSrc:
+    """Foto elegida en la galería de Android (content://...)."""
+
+    def __init__(self, uri):
+        self.uri = uri
+
+    def open(self):
+        from jnius import autoclass
+        activity = autoclass("org.kivy.android.PythonActivity").mActivity
+        pfd = activity.getContentResolver().openFileDescriptor(self.uri, "r")
+        return os.fdopen(pfd.detachFd(), "rb")
+
+
+_PICK_REQ = 7731
+
+
+def pick_gallery(callback):
+    """Abre el selector de fotos de Android (selección múltiple). callback(list[UriSrc])."""
+    from android import activity as android_activity
+    from jnius import autoclass
+    Intent = autoclass("android.content.Intent")
+    activity = autoclass("org.kivy.android.PythonActivity").mActivity
+
+    def on_result(req, res, intent):
+        if req != _PICK_REQ:
+            return
+        android_activity.unbind(on_activity_result=on_result)
+        if res != -1 or intent is None:  # -1 = RESULT_OK
+            return
+        srcs = []
+        clip = intent.getClipData()
+        if clip is not None:
+            for i in range(clip.getItemCount()):
+                srcs.append(UriSrc(clip.getItemAt(i).getUri()))
+        else:
+            data = intent.getData()
+            if data is not None:
+                srcs.append(UriSrc(data))
+        if srcs:
+            Clock.schedule_once(lambda _dt: callback(srcs))
+
+    android_activity.bind(on_activity_result=on_result)
+    it = Intent(Intent.ACTION_GET_CONTENT)
+    it.setType("image/*")
+    it.addCategory(Intent.CATEGORY_OPENABLE)
+    it.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, True)
+    activity.startActivityForResult(it, _PICK_REQ)
 
 
 # ------------------------------------------------------------------ widgets base
@@ -197,6 +291,10 @@ class AppBar(BoxLayout):
         if right:
             self.add_widget(right)
 
+    def on_touch_down(self, touch):
+        r = super().on_touch_down(touch)
+        return r or self.collide_point(*touch.pos)
+
 
 class Toast(Label):
     def __init__(self, text, **kw):
@@ -230,6 +328,120 @@ class Busy(ModalView):
     def show(self, text):
         self.msg.text = text
         self.open()
+
+
+class Sheet(BoxLayout):
+    """Panel inferior: absorbe los toques para no mover la foto que hay detrás."""
+
+    def on_touch_down(self, touch):
+        r = super().on_touch_down(touch)
+        return r or self.collide_point(*touch.pos)
+
+
+class ArrowBtn(RBtn):
+    """Botón con flecha dibujada (arriba/abajo), sin depender de fuentes."""
+
+    def __init__(self, **kw):
+        super().__init__(text="", radius=15, **kw)
+        self.up = False
+        with self.canvas.after:
+            Color(*TEXT)
+            self._ln = Line(points=[0, 0, 0, 0, 0, 0], width=dp(2), cap="round", joint="round")
+        self.bind(pos=self._arrow, size=self._arrow)
+
+    def set_up(self, up):
+        self.up = up
+        self._arrow()
+
+    def _arrow(self, *_):
+        cx, cy = self.center
+        w, h = dp(10), dp(5)
+        self._ln.points = ([cx - w, cy - h, cx, cy + h, cx + w, cy - h] if self.up
+                           else [cx - w, cy + h, cx, cy - h, cx + w, cy + h])
+
+
+class PhotoView(Widget):
+    """Foto centrada con arrastre de un dedo y zoom de pinza. Una sola textura en GPU: fluido.
+    El zoom crece desde el centro de la foto y nunca deforma (misma escala en X e Y)."""
+    inset_top = NumericProperty(0)
+    inset_bottom = NumericProperty(0)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.tex, self.scale, self.ox, self.oy, self._t = None, 1.0, 0.0, 0.0, {}
+        with self.canvas:
+            Color(1, 1, 1, 1)
+            self._rect = Rectangle(size=(0, 0))
+        self.bind(pos=self._layout, size=self._layout,
+                  inset_top=self._layout, inset_bottom=self._layout)
+
+    def set_texture(self, tex):
+        self.tex = tex
+        self._rect.texture = tex
+        self.reset()
+
+    def reset(self):
+        self.scale, self.ox, self.oy = 1.0, 0.0, 0.0
+        self._layout()
+
+    def _layout(self, *_):
+        if self.tex is None:
+            self._rect.size = (0, 0)
+            return
+        vw = self.width
+        vh = max(1.0, self.height - self.inset_top - self.inset_bottom)
+        tw, th = self.tex.size
+        k = min(vw / tw, vh / th) * 0.96 * self.scale
+        w, h = tw * k, th * k
+        cx = self.x + vw / 2 + self.ox
+        cy = self.y + self.inset_bottom + vh / 2 + self.oy
+        self._rect.pos = (cx - w / 2, cy - h / 2)
+        self._rect.size = (w, h)
+
+    def _zoom(self, f):
+        self.scale = max(0.2, min(10.0, self.scale * f))
+
+    def _clamp(self):
+        self.ox = max(-self.width, min(self.width, self.ox))
+        self.oy = max(-self.height, min(self.height, self.oy))
+
+    def on_touch_down(self, t):
+        if self.tex is None or not self.collide_point(*t.pos):
+            return False
+        if getattr(t, "button", "") in ("scrollup", "scrolldown"):  # rueda del ratón (PC)
+            self._zoom(1.12 if t.button == "scrollup" else 1 / 1.12)
+            self._layout()
+            return True
+        t.grab(self)
+        self._t[t.uid] = t
+        if t.is_double_tap:
+            self.reset()
+        return True
+
+    def on_touch_move(self, t):
+        if t.grab_current is not self or t.uid not in self._t:
+            return False
+        if len(self._t) >= 2:
+            other = next(v for k, v in self._t.items() if k != t.uid)
+            d0 = math.hypot(t.ppos[0] - other.pos[0], t.ppos[1] - other.pos[1])
+            d1 = math.hypot(t.pos[0] - other.pos[0], t.pos[1] - other.pos[1])
+            if d0 > 1:
+                self._zoom(d1 / d0)
+            self.ox += t.dx / 2
+            self.oy += t.dy / 2
+        else:
+            self.ox += t.dx
+            self.oy += t.dy
+        self._clamp()
+        self._layout()
+        return True
+
+    def on_touch_up(self, t):
+        if t.grab_current is self:
+            t.ungrab(self)
+            self._t.pop(t.uid, None)
+            return True
+        return False
 
 
 # ------------------------------------------------------------------ galería
@@ -287,9 +499,14 @@ class Gallery(Screen):
         super().__init__(**kw)
         self.selected, self.thumbs, self._token, self.folder = [], {}, 0, ""
         root = BoxLayout(orientation="vertical")
-        pick = RBtn(text="Carpeta", bg=ACCENT, fg=WHITE, size_hint_x=None, width=dp(100))
+        pick = RBtn(text="Carpeta", bg=ACCENT, fg=WHITE)
         pick.bind(on_release=self.open_picker)
-        root.add_widget(AppBar("Mosaic Studio", right=pick))
+        quick = RBtn(text="Galería", bg=SURFACE2)
+        quick.bind(on_release=self.open_gallery)
+        right = BoxLayout(size_hint_x=None, width=dp(176), spacing=dp(6))
+        right.add_widget(quick)
+        right.add_widget(pick)
+        root.add_widget(AppBar("Mosaic Studio", right=right))
         self.sub = lbl("Elige una carpeta para empezar", 12, MUTED, size_hint_y=None,
                        height=dp(22), padding=(dp(16), 0))
         root.add_widget(self.sub)
@@ -319,7 +536,30 @@ class Gallery(Screen):
         for w in (all_b, clr, self.go):
             bar.add_widget(w)
         root.add_widget(bar)
+        foot = BoxLayout(size_hint_y=None, height=dp(44), padding=(0, dp(4), 0, dp(10)))
+        with foot.canvas.before:
+            Color(*SURFACE)
+            self._footbg = Rectangle(pos=foot.pos, size=foot.size)
+        foot.bind(pos=lambda i, v: setattr(self._footbg, "pos", v),
+                  size=lambda i, v: setattr(self._footbg, "size", v))
+        foot.add_widget(Image(source=BRAND, mipmap=True, opacity=0.9))
+        root.add_widget(foot)
         self.add_widget(root)
+
+    # --- galería del celular (selección rápida)
+    def open_gallery(self, *_):
+        if not IS_ANDROID:
+            toast("En el PC usa «Carpeta»")
+            self.open_picker()
+            return
+        try:
+            pick_gallery(self._from_gallery)
+        except Exception as e:
+            toast(f"No se pudo abrir la galería: {str(e)[:50]}", 3)
+
+    def _from_gallery(self, sources):
+        self.manager.get_screen("editor").load_images(sources)
+        self.manager.current = "editor"
 
     # --- carpeta
     def open_picker(self, *_):
@@ -436,48 +676,112 @@ class Editor(Screen):
         self.imgs, self.result, self.working, self.seed = [], None, False, None
         self.bc = (255, 255, 255)
         self.busy = Busy()
-        root = BoxLayout(orientation="vertical")
+        self.clean, self.sheet_open = False, True
+        self.handle_h = dp(38)
+        self.body_h = max(dp(250), min(dp(310), Window.height * 0.40))
+
+        # marca de agua: fija en el centro de la pantalla, detrás de la foto
+        self.wm = Image(source=BRAND, mipmap=True, size_hint=(None, None), opacity=0.5,
+                        pos_hint={"center_x": 0.5, "center_y": 0.5})
+        self.add_widget(self.wm)
+        self.pv = PhotoView()
+        self.add_widget(self.pv)
+        self.hint = lbl("Pulsa «Generar» para crear tu mosaico", 15, MUTED, halign="center",
+                        size_hint=(1, None), height=dp(40), pos_hint={"center_x": 0.5, "top": 0.88})
+        self.add_widget(self.hint)
+
+        self.sheet = self._build_sheet()
+        self.add_widget(self.sheet)
 
         back = RBtn(text="‹", font_size=sp(24), size_hint_x=None, width=dp(44), radius=22)
         back.bind(on_release=lambda *_: setattr(self.manager, "current", "gallery"))
-        save = RBtn(text="Guardar", bg=SURFACE2, size_hint_x=None, width=dp(96))
+        clean_btn = RBtn(text="Limpia", size_hint_x=None, width=dp(78))
+        clean_btn.bind(on_release=self.enter_clean)
+        save = RBtn(text="Guardar", bg=ACCENT, fg=WHITE, size_hint_x=None, width=dp(92))
         save.bind(on_release=self.save)
-        root.add_widget(AppBar("Editor", left=back, right=save))
+        right = BoxLayout(size_hint_x=None, width=dp(176), spacing=dp(6))
+        right.add_widget(clean_btn)
+        right.add_widget(save)
+        self.appbar = AppBar("Editor", left=back, right=right)
+        self.add_widget(self.appbar)
 
-        # vista previa
-        self.stage = FloatLayout()
-        self.scatter = Scatter(do_rotation=False, size_hint=(None, None), scale_min=0.5, scale_max=6)
-        self.preview = Image(allow_stretch=True)
-        self.scatter.add_widget(self.preview)
-        self.stage.add_widget(self.scatter)
-        self.hint = lbl("Pulsa «Generar» para crear\ntu mosaico", 15, MUTED,
-                        halign="center", size_hint=(1, 1))
-        self.stage.add_widget(self.hint)
-        self.stage.bind(size=self._fit_preview, pos=self._fit_preview)
-        root.add_widget(self.stage)
+        self.exit_btn = RBtn(text="Volver al editor", bg=(0.1, 0.11, 0.15, 0.85),
+                             size_hint=(None, None), size=(dp(150), dp(40)))
+        self.exit_btn.bind(on_release=self.exit_clean_mode)
+        self.add_widget(self.exit_btn)
 
-        root.add_widget(self._build_sheet())
-        self.add_widget(root)
+        self.sheet.bind(y=self._sync)
+        self.appbar.bind(y=self._sync)
+        self.bind(size=self._on_size)
+        Clock.schedule_once(lambda _dt: self._on_size(), 0)
 
-    def _fit_preview(self, *_):
-        if self.scatter.scale == 1:
-            self.scatter.size = self.stage.size
-            self.scatter.pos = self.stage.pos
+    # --- posiciones (panel, barra superior, botón de salida de vista limpia)
+    def _on_size(self, *_):
+        w = min(self.width * 0.62, dp(300))
+        self.wm.size = (w, w / BRAND_ASPECT)
+        self.exit_btn.x = self.width - self.exit_btn.width - dp(12)
+        self._place(False)
 
-    # --- hoja inferior
+    def _place(self, animate=True):
+        H = self.height
+        if self.clean:
+            ty = -(self.body_h + self.handle_h)
+        else:
+            ty = 0 if self.sheet_open else -self.body_h
+        targets = ((self.sheet, ty),
+                   (self.appbar, H if self.clean else H - self.appbar.height),
+                   (self.exit_btn, H - dp(52) if self.clean else H + dp(10)))
+        for w, y in targets:
+            Animation.cancel_all(w, "y")
+            if animate:
+                Animation(y=y, duration=0.25, t="out_quad").start(w)
+            else:
+                w.y = y
+
+    def _sync(self, *_):
+        """La foto se centra en el espacio libre entre la barra superior y el panel."""
+        self.pv.inset_bottom = max(0, self.sheet.top)
+        self.pv.inset_top = max(0, self.height - self.appbar.y)
+
+    def toggle_sheet(self, *_):
+        if self.clean:
+            return
+        self.sheet_open = not self.sheet_open
+        self.arrow.set_up(not self.sheet_open)
+        self._place(True)
+
+    def enter_clean(self, *_):
+        if self.result is None:
+            toast("Genera un mosaico primero")
+            return
+        self.clean = True
+        self._place(True)
+        toast("Pellizca para ampliar. Doble toque: restablecer", 2.8)
+
+    def exit_clean_mode(self, *_):
+        self.clean = False
+        self._place(True)
+
+    # --- panel de ajustes
     def _build_sheet(self):
-        sheet = BoxLayout(orientation="vertical", size_hint_y=None, height=dp(330),
-                          padding=(dp(14), dp(14), dp(14), dp(10)), spacing=dp(10))
+        sheet = Sheet(orientation="vertical", size_hint=(1, None), height=self.handle_h + self.body_h)
         with sheet.canvas.before:
             Color(*SURFACE)
             self._sbg = RoundedRectangle(pos=sheet.pos, size=sheet.size, radius=[dp(24)])
         sheet.bind(pos=self._sheet_bg, size=self._sheet_bg)
 
-        self.tabs = ChipGroup(["Estilo", "Ajustes", "Formato"], "Estilo", self._tab, cols=3, height=38)
-        sheet.add_widget(self.tabs.widget)
+        handle = FloatLayout(size_hint_y=None, height=self.handle_h)
+        self.arrow = ArrowBtn(size_hint=(None, None), size=(dp(72), dp(30)),
+                              pos_hint={"center_x": 0.5, "center_y": 0.5}, bg=SURFACE2)
+        self.arrow.bind(on_release=self.toggle_sheet)
+        handle.add_widget(self.arrow)
 
+        body = BoxLayout(orientation="vertical", size_hint_y=None, height=self.body_h,
+                         padding=(dp(14), 0, dp(14), dp(10)), spacing=dp(10))
+        self.tabs = ChipGroup(["Estilo", "Ajustes", "Formato"], "Estilo", self._tab, cols=3, height=38)
+        body.add_widget(self.tabs.widget)
         self.sv = ScrollView(do_scroll_x=False)
-        sheet.add_widget(self.sv)
+        body.add_widget(self.sv)
 
         self.style = ChipGroup(engine.STYLES, "Diamante", cols=3)
         self.aspect = ChipGroup(list(engine.ASPECTS) + ["Original"], "16:9", cols=3)
@@ -506,15 +810,13 @@ class Editor(Screen):
                                       self.t_rand, self.t_mix, self.t_fix, sw_title, self.sw_grid)
         self.set_color(self.bc)
 
-        actions = BoxLayout(size_hint_y=None, height=dp(52), spacing=dp(8))
-        self.fmt = ChipGroup(["JPG", "PNG"], "JPG", cols=2, height=52)
-        self.fmt.widget.size_hint_x = None
-        self.fmt.widget.width = dp(130)
-        gen = RBtn(text="Generar", bg=ACCENT, fg=WHITE, font_size=sp(16), bold=True, radius=16)
+        gen = RBtn(text="Generar", bg=ACCENT, fg=WHITE, font_size=sp(16), bold=True, radius=16,
+                   size_hint_y=None, height=dp(52))
         gen.bind(on_release=self.generate)
-        actions.add_widget(self.fmt.widget)
-        actions.add_widget(gen)
-        sheet.add_widget(actions)
+        body.add_widget(gen)
+
+        sheet.add_widget(handle)
+        sheet.add_widget(body)
         self._tab("Estilo")
         return sheet
 
@@ -542,8 +844,7 @@ class Editor(Screen):
         for col, b in self.swatch_btns:
             lum = 0.299 * col[0] + 0.587 * col[1] + 0.114 * col[2]
             b.text = "•" if col == c else ""
-            b.color = (0, 0, 0, 1) if lum > 140 else WHITE
-            b.set_colors(b.bg, b.color)
+            b.set_colors(b.bg, (0, 0, 0, 1) if lum > 140 else WHITE)
 
     def pick_color(self, *_):
         from kivy.uix.colorpicker import ColorPicker
@@ -563,14 +864,29 @@ class Editor(Screen):
         ok.bind(on_release=done)
         pop.open()
 
-    # --- cargar fotos
-    def load_images(self, paths):
+    # --- cargar fotos (rutas de archivo o fotos de la galería del teléfono)
+    def load_images(self, items):
         self.imgs, self.working = [], True
-        self.busy.show(f"Cargando {len(paths)} fotos…")
-        threading.Thread(target=self._load_worker, args=(paths,), daemon=True).start()
+        self.busy.show(f"Cargando {len(items)} fotos…")
+        threading.Thread(target=self._load_worker, args=(items,), daemon=True).start()
 
-    def _load_worker(self, paths):
-        imgs = [im for im in (engine.load_image(p) for p in paths) if im is not None]
+    def _load_worker(self, items):
+        imgs = []
+        for it in items:
+            src = None
+            try:
+                src = it.open() if hasattr(it, "open") else it
+                im = engine.load_image(src)
+            except Exception:
+                im = None
+            finally:
+                if src is not None and not isinstance(src, str):
+                    try:
+                        src.close()
+                    except Exception:
+                        pass
+            if im is not None:
+                imgs.append(im)
         Clock.schedule_once(lambda _dt: self._loaded(imgs))
 
     def _loaded(self, imgs):
@@ -608,7 +924,7 @@ class Editor(Screen):
         try:
             out = engine.render(**args)
             prev = out.copy()
-            prev.thumbnail((1600, 1600))
+            prev.thumbnail((2048, 2048))
             buf = io.BytesIO()
             prev.save(buf, "JPEG", quality=90)
             data = buf.getvalue()
@@ -619,10 +935,8 @@ class Editor(Screen):
 
     def _done(self, out, data):
         self.result = out
-        self.preview.texture = CoreImage(io.BytesIO(data), ext="jpg").texture
+        self.pv.set_texture(CoreImage(io.BytesIO(data), ext="jpg").texture)
         self.hint.opacity = 0
-        self.scatter.scale = 1
-        self.scatter.size, self.scatter.pos = self.stage.size, self.stage.pos
         self.working = False
         self.busy.dismiss()
         toast("Mosaico listo")
@@ -634,7 +948,7 @@ class Editor(Screen):
 
     # --- recordar ajustes
     def get_settings(self):
-        return dict(style=self.style.value, aspect=self.aspect.value, fmt=self.fmt.value,
+        return dict(style=self.style.value, aspect=self.aspect.value,
                     size=self.s_size.value, bt=self.s_border.value, vari=self.s_var.value,
                     rot=self.s_rot.value, rr=self.t_rand.active, mix=self.t_mix.active,
                     fix=self.t_fix.active, bc=list(self.bc))
@@ -643,38 +957,50 @@ class Editor(Screen):
         try:
             self.style.select(d["style"], False)
             self.aspect.select(d["aspect"], False)
-            self.fmt.select(d["fmt"], False)
             self.s_size.slider.value, self.s_border.slider.value = d["size"], d["bt"]
             self.s_var.slider.value, self.s_rot.slider.value = d["vari"], d["rot"]
-            for t, k in ((self.t_rand, "rr"), (self.t_mix, "mix"), (self.t_fix, "fix")):
-                t.active = d[k]
-                t._paint()
+            for tg, k in ((self.t_rand, "rr"), (self.t_mix, "mix"), (self.t_fix, "fix")):
+                tg.active = d[k]
+                tg._paint()
             self.set_color(tuple(d["bc"]))
         except Exception:
             pass  # ajustes viejos o corruptos: se usan los valores por defecto
 
-    # --- guardar
+    # --- guardar: elegir formato y exportar a la galería
     def save(self, *_):
         if self.result is None:
             toast("Genera un mosaico primero")
             return
-        fmt = self.fmt.value.lower()
-        threading.Thread(target=self._save_worker, args=(self.result, fmt), daemon=True).start()
+        box = BoxLayout(orientation="vertical", spacing=dp(10), padding=dp(12))
+        box.add_widget(lbl("Elige el formato del archivo", 14, MUTED, halign="center",
+                           size_hint_y=None, height=dp(24)))
+        row = BoxLayout(size_hint_y=None, height=dp(54), spacing=dp(10))
+        jpg = RBtn(text="JPG", bg=ACCENT, fg=WHITE, bold=True, font_size=sp(16))
+        png = RBtn(text="PNG", bold=True, font_size=sp(16))
+        row.add_widget(jpg)
+        row.add_widget(png)
+        cancel = RBtn(text="Cancelar", size_hint_y=None, height=dp(44))
+        box.add_widget(row)
+        box.add_widget(cancel)
+        pop = Popup(title="Guardar en la galería", content=box, size_hint=(0.86, None),
+                    height=dp(240), background="", background_color=SURFACE, separator_color=ACCENT)
+
+        def choose(fmt, *_):
+            pop.dismiss()
+            self._export(fmt)
+
+        jpg.bind(on_release=partial(choose, "jpg"))
+        png.bind(on_release=partial(choose, "png"))
+        cancel.bind(on_release=pop.dismiss)
+        pop.open()
+
+    def _export(self, fmt):
         toast("Guardando…", 1.2)
+        threading.Thread(target=self._save_worker, args=(self.result, fmt), daemon=True).start()
 
     def _save_worker(self, img, fmt):
-        try:
-            os.makedirs(EXPORT_DIR, exist_ok=True)
-            path = os.path.join(EXPORT_DIR, f"{unique_name()}.{fmt}")
-            if fmt == "jpg":
-                img.save(path, "JPEG", quality=95, subsampling=0)
-            else:
-                img.save(path, "PNG")
-            media_scan(path)
-            Clock.schedule_once(lambda _dt: toast("Guardado en Pictures/MosaicStudio", 3))
-        except Exception as e:
-            msg = str(e)[:80]
-            Clock.schedule_once(lambda _dt, m=msg: toast(f"No se pudo guardar: {m}", 3.5))
+        ok, msg = save_to_gallery(img, unique_name(), fmt)
+        Clock.schedule_once(lambda _dt: toast(msg, 3.2))
 
 
 # ------------------------------------------------------------------ app
@@ -706,9 +1032,13 @@ class MosaicStudioApp(App):
             pass
 
     def _key(self, _win, key, *_):
-        """Botón atrás de Android: vuelve a la galería en vez de cerrar la app."""
+        """Botón atrás de Android: sale de vista limpia, luego vuelve a la galería."""
         if key == 27 and self.sm.current == "editor":
-            self.sm.current = "gallery"
+            ed = self.sm.get_screen("editor")
+            if ed.clean:
+                ed.exit_clean_mode()
+            else:
+                self.sm.current = "gallery"
             return True
         return False
 

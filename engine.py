@@ -87,23 +87,153 @@ def _pool(imgs, shuffle):
 
 
 # ---------------------------------------------------------------- layouts
+# Área media de cada pieza (en unidades de s*s). Sirve para limitar el número de piezas.
+_AREA = {"Cuadrado": 1.0, "Diamante": 0.5, "Hexágono": 0.65, "Triángulo": 0.43,
+         "Cruz": 0.56, "Estrella": 0.5, "Círculo": 0.5, "Mixto": 0.43}
+
+
+def _tess(style, bx0, by0, bx1, by1, s):
+    """Polígonos que encajan SIN huecos y cubren el rectángulo (bx0,by0)-(bx1,by1).
+    Las piezas comparten vértices exactos, así que no queda fondo visible entre ellas."""
+    m = s * 1.5
+    x0, y0, x1, y1 = bx0 - m, by0 - m, bx1 + m, by1 + m
+    P = []
+    if style == "Cuadrado":
+        for j in range(int(y0 // s) - 1, int(y1 // s) + 2):
+            for i in range(int(x0 // s) - 1, int(x1 // s) + 2):
+                P.append([(i * s, j * s), ((i + 1) * s, j * s), ((i + 1) * s, (j + 1) * s), (i * s, (j + 1) * s)])
+    elif style == "Diamante":
+        h = s / 2
+        for j in range(int(y0 // h) - 1, int(y1 // h) + 2):
+            for i in range(int(x0 // s) - 1, int(x1 // s) + 2):
+                cx, cy = i * s + (j % 2) * h, j * h
+                P.append([(cx, cy - h), (cx + h, cy), (cx, cy + h), (cx - h, cy)])
+    elif style == "Hexágono":
+        R = s / 2
+        dx, dy = 1.5 * R, math.sqrt(3) * R
+        for c in range(int(x0 // dx) - 1, int(x1 // dx) + 2):
+            for r in range(int(y0 // dy) - 1, int(y1 // dy) + 2):
+                cx, cy = c * dx, r * dy + (c % 2) * dy / 2
+                P.append([(cx + R * math.cos(math.radians(60 * k)), cy + R * math.sin(math.radians(60 * k)))
+                          for k in range(6)])
+    elif style in ("Triángulo", "Mixto"):
+        hh = s * math.sqrt(3) / 2
+        for j in range(int(y0 // hh) - 1, int(y1 // hh) + 2):
+            for i in range(int(x0 // s) - 1, int(x1 // s) + 2):
+                x, y = i * s + (j % 2) * s / 2, j * hh
+                P.append([(x + s / 2, y), (x + s, y + hh), (x, y + hh)])
+                P.append([(x + s / 2, y), (x + 1.5 * s, y), (x + s, y + hh)])
+        if style == "Mixto":
+            P = _merge_triangles(P)
+    elif style == "Cruz":
+        u = s / 3
+        b, r = u / 2, 1.5 * u
+        cross = [(-b, -r), (b, -r), (b, -b), (r, -b), (r, b), (b, b),
+                 (b, r), (-b, r), (-b, b), (-r, b), (-r, -b), (-b, -b)]
+        n = int(max(abs(x0), abs(x1), abs(y0), abs(y1)) / u) + 3
+        for i in range(-n, n + 1):
+            for j in range(-n, n + 1):
+                cx, cy = (2 * i - j) * u, (i + 2 * j) * u
+                if x0 - s < cx < x1 + s and y0 - s < cy < y1 + s:
+                    P.append([(cx + px, cy + py) for px, py in cross])
+    elif style == "Estrella":  # estrellas de 4 puntas que se tocan por la punta + piezas de relleno
+        r = s / 2
+        n = 0.56 * r / math.sqrt(2)
+        star = [(r, 0), (n, n), (0, r), (-n, n), (-r, 0), (-n, -n), (0, -r), (n, -n)]
+        gap = [(0, -r), (r - n, -r + n), (r, 0), (r - n, r - n), (0, r),
+               (-r + n, r - n), (-r, 0), (-r + n, -r + n)]
+        for j in range(int(y0 // s) - 1, int(y1 // s) + 2):
+            for i in range(int(x0 // s) - 1, int(x1 // s) + 2):
+                P.append([(i * s + px, j * s + py) for px, py in star])
+                P.append([((i + .5) * s + px, (j + .5) * s + py) for px, py in gap])
+    elif style == "Círculo":  # círculos tangentes + piezas curvas que rellenan los huecos
+        r = s / 2
+        circ = [(r * math.cos(math.tau * k / 40), r * math.sin(math.tau * k / 40)) for k in range(40)]  # pasos de 9°: coinciden con los arcos del relleno
+        pts = {}
+        for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+            base = math.atan2(-sy, -sx)
+            for k in range(11):
+                a_ = base - math.pi / 4 + (math.pi / 2) * k / 10
+                p = (sx * r + r * math.cos(a_), sy * r + r * math.sin(a_))
+                pts[(round(p[0], 3), round(p[1], 3))] = p
+        gap = sorted(pts.values(), key=lambda p: math.atan2(p[1], p[0]))
+        for j in range(int(y0 // s) - 1, int(y1 // s) + 2):
+            for i in range(int(x0 // s) - 1, int(x1 // s) + 2):
+                P.append([(i * s + px, j * s + py) for px, py in circ])
+                P.append([((i + .5) * s + px, (j + .5) * s + py) for px, py in gap])
+    return [[(round(x, 3), round(y, 3)) for x, y in poly] for poly in P]
+
+
+def _merge_triangles(tris):
+    """Une triángulos vecinos al azar en rombos: mosaico irregular, igualmente sin huecos."""
+    key = lambda p: (round(p[0] * 4), round(p[1] * 4))
+    edges = {}
+    for idx, tr in enumerate(tris):
+        for k in range(3):
+            edges.setdefault(frozenset((key(tr[k]), key(tr[(k + 1) % 3]))), []).append((idx, k))
+    order = list(range(len(tris)))
+    random.shuffle(order)
+    used, out = set(), []
+    for idx in order:
+        if idx in used:
+            continue
+        used.add(idx)
+        tr = tris[idx]
+        if random.random() < 0.6:
+            nb = []
+            for k in range(3):
+                for j, kk in edges[frozenset((key(tr[k]), key(tr[(k + 1) % 3])))]:
+                    if j != idx and j not in used:
+                        nb.append((j, k, kk))
+            if nb:
+                j, k, kk = random.choice(nb)
+                used.add(j)
+                other = tris[j]
+                out.append([tr[(k + 2) % 3], tr[k], other[(kk + 2) % 3], tr[(k + 1) % 3]])
+                continue
+        out.append(tr)
+    return out
+
+
+def _transform(polys, jit, rot, cx, cy):
+    """Irregularidad (vértices compartidos se mueven igual: sigue sin haber huecos) y giro global."""
+    ca, sa = math.cos(math.radians(rot)), math.sin(math.radians(rot))
+    moved, out = {}, []
+    for poly in polys:
+        pts = []
+        for x, y in poly:
+            if jit > 0:
+                k = (round(x * 4), round(y * 4))
+                if k not in moved:
+                    moved[k] = (random.uniform(-jit, jit), random.uniform(-jit, jit))
+                x, y = x + moved[k][0], y + moved[k][1]
+            if rot:
+                x, y = cx + (x - cx) * ca - (y - cy) * sa, cy + (x - cx) * sa + (y - cy) * ca
+            pts.append((x, y))
+        out.append(pts)
+    return out
+
+
 def render_tiles(w, h, imgs, shape, s, bt, bc, rng, rot, rot_random, shuffle):
     canvas = Image.new("RGB", (w, h), bc)
     pool = _pool(imgs, shuffle)
-    step = max(10, int(s * (1 - rng)))
-    ratio = 1.0 if shape == "Cuadrado" else (0.75 if shape == "Cruz" else 0.5)
-    while (w / step + 3) * (h / (step * ratio) + 3) > MAX_TILES:
-        step = int(step * 1.15) + 1
-    step_y = max(5, int(step * ratio))
-    stagger = shape != "Cuadrado"
-    for r in range(-1, math.ceil(h / step_y) + 1):
-        shift = step // 2 if (stagger and r % 2) else 0
-        for c in range(-1, math.ceil(w / step) + 1):
-            size = int(s * (1 + random.uniform(-rng, rng))) if rng > 0 else s
-            sh = random.choice(SHAPES) if shape == "Mixto" else shape
-            ang = rot + (random.uniform(-180, 180) if rot_random else 0)
-            pts = shape_points(sh, c * step + shift, r * step_y, size, ang)
-            paste_poly(canvas, next(pool), pts, bt, bc)
+    s = max(24, int(s))
+    angle = rot + (random.uniform(-180, 180) if rot_random else 0)
+    cover = w * h * (2 if angle else 1)
+    while cover / (s * s * _AREA.get(shape, 1.0)) > MAX_TILES:
+        s = int(s * 1.15) + 1
+    if angle:
+        R = math.hypot(w, h) / 2
+        bounds = (w / 2 - R, h / 2 - R, w / 2 + R, h / 2 + R)
+    else:
+        bounds = (0, 0, w, h)
+    polys = _tess(shape, *bounds, s)
+    polys = _transform(polys, rng * s * 0.3, angle, w / 2, h / 2)
+    for pts in polys:
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        if max(xs) < 0 or max(ys) < 0 or min(xs) > w or min(ys) > h:
+            continue  # fuera del lienzo: no gasta fotos
+        paste_poly(canvas, next(pool), pts, bt, bc)
     return canvas
 
 

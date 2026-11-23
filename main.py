@@ -790,7 +790,7 @@ class Editor(Screen):
 
         self.s_size = SliderRow("Tamaño de tesela", 50, 800, 400, 10, "{:.0f} px")
         self.s_border = SliderRow("Grosor de borde", 0, 50, 8, 1, "{:.0f} px")
-        self.s_var = SliderRow("Variación de tamaño", 0, 0.5, 0.12, 0.01, "{:.2f}")
+        self.s_var = SliderRow("Irregularidad", 0, 0.5, 0.0, 0.01, "{:.2f}")
         self.s_rot = SliderRow("Rotación fija", -180, 180, 0, 1, "{:.0f}°")
         self.t_rand = Toggle("Rotación aleatoria", False, size_hint_y=None, height=dp(42))
         self.t_mix = Toggle("Mezclar fotos", True, size_hint_y=None, height=dp(42))

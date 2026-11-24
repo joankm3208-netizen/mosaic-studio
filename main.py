@@ -743,6 +743,10 @@ class Editor(Screen):
         self.pv.inset_bottom = max(0, self.sheet.top)
         self.pv.inset_top = max(0, self.height - self.appbar.y)
 
+    def _style_hint(self, name):
+        if name == "Foto-mosaico":
+            toast("Se reconstruye la PRIMERA foto con las demás", 3.2)
+
     def toggle_sheet(self, *_):
         if self.clean:
             return
@@ -783,7 +787,7 @@ class Editor(Screen):
         self.sv = ScrollView(do_scroll_x=False)
         body.add_widget(self.sv)
 
-        self.style = ChipGroup(engine.STYLES, "Diamante", cols=3)
+        self.style = ChipGroup(engine.STYLES, "Diamante", self._style_hint, cols=3)
         self.aspect = ChipGroup(list(engine.ASPECTS) + ["Original"], "16:9", cols=3)
         self.page_style = self._wrap(self.style.widget)
         self.page_aspect = self._wrap(self.aspect.widget)

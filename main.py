@@ -33,6 +33,7 @@ from kivy.uix.scatter import Scatter
 from kivy.uix.screenmanager import Screen, ScreenManager, SlideTransition
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.slider import Slider
+from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 from kivy.properties import NumericProperty
 from PIL import Image as PILImage, ImageOps
@@ -100,7 +101,7 @@ def media_scan(path):
 
 
 def save_to_gallery(img, name, fmt):
-    """Guarda en la galería del teléfono (MediaStore en Android 10+). Devuelve (ok, mensaje)."""
+    """Guarda en la galería del teléfono (MediaStore en Android 10+). Devuelve (ok, mensaje, uri); uri sirve para compartir."""
     fname = f"{name}.{fmt}"
     mime = "image/jpeg" if fmt == "jpg" else "image/png"
     pil_fmt = "JPEG" if fmt == "jpg" else "PNG"
@@ -122,7 +123,7 @@ def save_to_gallery(img, name, fmt):
                 fd = resolver.openFileDescriptor(uri, "w").detachFd()
                 with os.fdopen(fd, "wb") as f:
                     img.save(f, pil_fmt, **kw)
-                return True, "Guardado en la galería (Pictures/MosaicStudio)"
+                return True, "Guardado en la galería (Pictures/MosaicStudio)", uri
         except Exception:
             pass  # si falla, se intenta por ruta de archivo
     try:
@@ -130,9 +131,21 @@ def save_to_gallery(img, name, fmt):
         path = os.path.join(EXPORT_DIR, fname)
         img.save(path, pil_fmt, **kw)
         media_scan(path)
-        return True, "Guardado en Pictures/MosaicStudio"
+        return True, "Guardado en Pictures/MosaicStudio", None
     except Exception as e:
-        return False, f"No se pudo guardar: {str(e)[:70]}"
+        return False, f"No se pudo guardar: {str(e)[:70]}", None
+
+
+def share_image(uri, fmt):
+    """Abre el menú «Compartir» de Android con la imagen ya guardada en la galería."""
+    from jnius import autoclass, cast
+    Intent = autoclass("android.content.Intent")
+    activity = autoclass("org.kivy.android.PythonActivity").mActivity
+    it = Intent(Intent.ACTION_SEND)
+    it.setType("image/jpeg" if fmt == "jpg" else "image/png")
+    it.putExtra(Intent.EXTRA_STREAM, cast("android.os.Parcelable", uri))
+    it.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    activity.startActivity(Intent.createChooser(it, "Compartir mosaico"))
 
 
 class UriSrc:
@@ -369,6 +382,7 @@ class PhotoView(Widget):
     def __init__(self, **kw):
         super().__init__(**kw)
         self.tex, self.scale, self.ox, self.oy, self._t = None, 1.0, 0.0, 0.0, {}
+        self.tap_cb, self._tap = None, None
         with self.canvas:
             Color(1, 1, 1, 1)
             self._rect = Rectangle(size=(0, 0))
@@ -414,6 +428,7 @@ class PhotoView(Widget):
             return True
         t.grab(self)
         self._t[t.uid] = t
+        self._tap = (t.uid, t.pos) if len(self._t) == 1 else None
         if t.is_double_tap:
             self.reset()
         return True
@@ -421,6 +436,8 @@ class PhotoView(Widget):
     def on_touch_move(self, t):
         if t.grab_current is not self or t.uid not in self._t:
             return False
+        if self._tap and math.hypot(t.pos[0] - self._tap[1][0], t.pos[1] - self._tap[1][1]) > dp(10):
+            self._tap = None
         if len(self._t) >= 2:
             other = next(v for k, v in self._t.items() if k != t.uid)
             d0 = math.hypot(t.ppos[0] - other.pos[0], t.ppos[1] - other.pos[1])
@@ -440,8 +457,21 @@ class PhotoView(Widget):
         if t.grab_current is self:
             t.ungrab(self)
             self._t.pop(t.uid, None)
+            tap, self._tap = self._tap, None
+            if tap and tap[0] == t.uid and self.tap_cb and not self._t:
+                r = self._rect
+                u, v = (t.pos[0] - r.pos[0]) / max(1, r.size[0]), (t.pos[1] - r.pos[1]) / max(1, r.size[1])
+                if 0 <= u <= 1 and 0 <= v <= 1:
+                    self.tap_cb(u, v)
             return True
         return False
+
+
+class HistThumb(ButtonBehavior, Image):
+    def __init__(self, entry, **kw):
+        super().__init__(**kw)
+        self.entry = entry
+        self.texture = CoreImage(io.BytesIO(entry["thumb"]), ext="jpg").texture
 
 
 # ------------------------------------------------------------------ galería
@@ -674,6 +704,7 @@ class Editor(Screen):
     def __init__(self, **kw):
         super().__init__(**kw)
         self.imgs, self.result, self.working, self.seed = [], None, False, None
+        self.overrides, self.history = {}, []
         self.bc = (255, 255, 255)
         self.busy = Busy()
         self.clean, self.sheet_open = False, True
@@ -782,7 +813,7 @@ class Editor(Screen):
 
         body = BoxLayout(orientation="vertical", size_hint_y=None, height=self.body_h,
                          padding=(dp(14), 0, dp(14), dp(10)), spacing=dp(10))
-        self.tabs = ChipGroup(["Estilo", "Ajustes", "Formato"], "Estilo", self._tab, cols=3, height=38)
+        self.tabs = ChipGroup(["Estilo", "Ajustes", "Formato", "Extras"], "Estilo", self._tab, cols=4, height=38)
         body.add_widget(self.tabs.widget)
         self.sv = ScrollView(do_scroll_x=False)
         body.add_widget(self.sv)
@@ -814,6 +845,35 @@ class Editor(Screen):
                                       self.t_rand, self.t_mix, self.t_fix, sw_title, self.sw_grid)
         self.set_color(self.bc)
 
+        # --- Extras: filtros, borde, marca, edición por pieza, historial y favoritos
+        sec = lambda txt: lbl(txt, 13, MUTED, size_hint_y=None, height=dp(26))
+        self.fx = ChipGroup(engine.FX, "Ninguno", cols=2, height=40)
+        self.s_bright = SliderRow("Brillo", 0.5, 1.5, 1.0, 0.05, "{:.2f}")
+        self.s_contrast = SliderRow("Contraste", 0.5, 1.5, 1.0, 0.05, "{:.2f}")
+        self.border = ChipGroup(engine.BORDERS, "Sólido", cols=2, height=40)
+        self.t_brand = Toggle("Marca PHAIZERX al exportar", False, size_hint_y=None, height=dp(42))
+        self.t_edit = Toggle("Tocar una pieza cambia su foto", False, size_hint_y=None, height=dp(42))
+        self.hist_grid = GridLayout(cols=4, spacing=dp(6), size_hint_y=None,
+                                    row_default_height=dp(62), row_force_default=True)
+        self.hist_grid.bind(minimum_height=self.hist_grid.setter("height"))
+        self.fav_name = TextInput(hint_text="Nombre del favorito", multiline=False, size_hint_y=None,
+                                  height=dp(42), font_size=sp(14), background_normal="", background_active="",
+                                  background_color=SURFACE2, foreground_color=TEXT, hint_text_color=MUTED,
+                                  cursor_color=ACCENT, padding=(dp(12), dp(10)))
+        fav_save = RBtn(text="Guardar ajustes actuales", bg=ACCENT, fg=WHITE, size_hint_y=None, height=dp(42))
+        fav_save.bind(on_release=self.fav_add)
+        self.fav_box = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(6))
+        self.fav_box.bind(minimum_height=self.fav_box.setter("height"))
+        self.page_extra = self._wrap(
+            sec("Filtro de las fotos"), self.fx.widget, self.s_bright, self.s_contrast,
+            sec("Borde (el color base se elige en Ajustes)"), self.border.widget,
+            self.t_brand, self.t_edit,
+            sec("Historial: toca para recuperar"), self.hist_grid,
+            sec("Favoritos"), self.fav_name, fav_save, self.fav_box)
+        self.pv.tap_cb = self._piece_tap
+        self._refresh_history()
+        self._refresh_favs()
+
         gen = RBtn(text="Generar", bg=ACCENT, fg=WHITE, font_size=sp(16), bold=True, radius=16,
                    size_hint_y=None, height=dp(52))
         gen.bind(on_release=self.generate)
@@ -837,7 +897,8 @@ class Editor(Screen):
         return box
 
     def _tab(self, name):
-        page = {"Estilo": self.page_style, "Ajustes": self.page_adjust, "Formato": self.page_aspect}[name]
+        page = {"Estilo": self.page_style, "Ajustes": self.page_adjust, "Formato": self.page_aspect,
+                "Extras": self.page_extra}[name]
         self.sv.clear_widgets()
         self.sv.add_widget(page)
         self.sv.scroll_y = 1
@@ -871,6 +932,8 @@ class Editor(Screen):
     # --- cargar fotos (rutas de archivo o fotos de la galería del teléfono)
     def load_images(self, items):
         self.imgs, self.working = [], True
+        self.overrides, self.history = {}, []
+        self._refresh_history()
         self.busy.show(f"Cargando {len(items)} fotos…")
         threading.Thread(target=self._load_worker, args=(items,), daemon=True).start()
 
@@ -907,20 +970,26 @@ class Editor(Screen):
             return int(w * k), int(h * k)
         return engine.ASPECTS.get(name, (1920, 1080))
 
-    def generate(self, *_):
+    def generate(self, *_, keep=False):
+        """keep=True repite el mismo diseño (misma semilla y piezas elegidas a mano)."""
         if self.working:
             return
         if not self.imgs:
             toast("Primero elige fotos en la galería")
             return
         self.working = True
-        if not (self.t_fix.active and self.seed is not None):
+        if not keep:
+            self.overrides = {}
+        if not (keep or (self.t_fix.active and self.seed is not None)):
             self.seed = random.randrange(1 << 30)
         w, h = self._size()
         args = dict(style=self.style.value, w=w, h=h, imgs=list(self.imgs),
                     s=int(self.s_size.value), bt=int(self.s_border.value), bc=self.bc,
                     rng=self.s_var.value, rot=self.s_rot.value,
-                    rot_random=self.t_rand.active, shuffle=self.t_mix.active, seed=self.seed)
+                    rot_random=self.t_rand.active, shuffle=self.t_mix.active, seed=self.seed,
+                    border=self.border.value, fx=self.fx.value,
+                    bright=self.s_bright.value, contrast=self.s_contrast.value,
+                    overrides=dict(self.overrides))
         self.busy.show("Generando mosaico…")
         threading.Thread(target=self._work, args=(args,), daemon=True).start()
 
@@ -932,15 +1001,23 @@ class Editor(Screen):
             buf = io.BytesIO()
             prev.save(buf, "JPEG", quality=90)
             data = buf.getvalue()
-            Clock.schedule_once(lambda _dt: self._done(out, data))
+            Clock.schedule_once(lambda _dt: self._done(out, data, args))
         except Exception as e:
             msg = str(e)[:90]
             Clock.schedule_once(lambda _dt, m=msg: self._fail(m))
 
-    def _done(self, out, data):
+    def _done(self, out, data, args):
         self.result = out
         self.pv.set_texture(CoreImage(io.BytesIO(data), ext="jpg").texture)
         self.hint.opacity = 0
+        thumb = out.copy()
+        thumb.thumbnail((200, 200))
+        tb = io.BytesIO()
+        thumb.save(tb, "JPEG", quality=80)
+        if not (self.history and self.history[0]["args"] is args):
+            self.history.insert(0, dict(args=args, thumb=tb.getvalue(), aspect=self.aspect.value))
+            del self.history[8:]
+        self._refresh_history()
         self.working = False
         self.busy.dismiss()
         toast("Mosaico listo")
@@ -955,7 +1032,9 @@ class Editor(Screen):
         return dict(style=self.style.value, aspect=self.aspect.value,
                     size=self.s_size.value, bt=self.s_border.value, vari=self.s_var.value,
                     rot=self.s_rot.value, rr=self.t_rand.active, mix=self.t_mix.active,
-                    fix=self.t_fix.active, bc=list(self.bc))
+                    fix=self.t_fix.active, bc=list(self.bc),
+                    fx=self.fx.value, border=self.border.value, bright=self.s_bright.value,
+                    contrast=self.s_contrast.value, brand=self.t_brand.active)
 
     def apply_settings(self, d):
         try:
@@ -969,8 +1048,113 @@ class Editor(Screen):
             self.set_color(tuple(d["bc"]))
         except Exception:
             pass  # ajustes viejos o corruptos: se usan los valores por defecto
+        try:
+            self.fx.select(d["fx"], False)
+            self.border.select(d["border"], False)
+            self.s_bright.slider.value, self.s_contrast.slider.value = d["bright"], d["contrast"]
+            self.t_brand.active = d["brand"]
+            self.t_brand._paint()
+        except Exception:
+            pass
 
-    # --- guardar: elegir formato y exportar a la galería
+    # --- historial: los últimos 8 mosaicos de estas fotos
+    def _refresh_history(self):
+        self.hist_grid.clear_widgets()
+        if not self.history:
+            self.hist_grid.add_widget(lbl("Aún no hay mosaicos.", 13, MUTED))
+            return
+        for e in self.history:
+            th = HistThumb(e)
+            th.bind(on_release=partial(self.restore, e))
+            self.hist_grid.add_widget(th)
+
+    def restore(self, entry, *_):
+        if self.working:
+            return
+        a = entry["args"]
+        self.style.select(a["style"], False)
+        self.aspect.select(entry["aspect"], False)
+        self.s_size.slider.value, self.s_border.slider.value = a["s"], a["bt"]
+        self.s_var.slider.value, self.s_rot.slider.value = a["rng"], a["rot"]
+        self.set_color(tuple(a["bc"]))
+        self.border.select(a["border"], False)
+        self.fx.select(a["fx"], False)
+        self.s_bright.slider.value, self.s_contrast.slider.value = a["bright"], a["contrast"]
+        self.seed, self.overrides = a["seed"], dict(a["overrides"])
+        self.generate(keep=True)        # mismo diseño exacto: la semilla lo reproduce
+
+    # --- favoritos con nombre
+    def _fav_path(self):
+        return os.path.join(App.get_running_app().user_data_dir, "favorites.json")
+
+    def _fav_load(self):
+        try:
+            with open(self._fav_path()) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _fav_dump(self, favs):
+        try:
+            os.makedirs(App.get_running_app().user_data_dir, exist_ok=True)
+            with open(self._fav_path(), "w") as f:
+                json.dump(favs, f)
+        except Exception:
+            toast("No se pudo guardar el favorito")
+
+    def fav_add(self, *_):
+        name = self.fav_name.text.strip()[:24]
+        if not name:
+            toast("Escribe un nombre para el favorito")
+            return
+        favs = self._fav_load()
+        favs[name] = self.get_settings()
+        self._fav_dump(favs)
+        self.fav_name.text = ""
+        self._refresh_favs()
+        toast(f"Favorito «{name}» guardado")
+
+    def _fav_use(self, name, *_):
+        self.apply_settings(self._fav_load().get(name, {}))
+        toast(f"Favorito «{name}» aplicado")
+
+    def _fav_del(self, name, *_):
+        favs = self._fav_load()
+        favs.pop(name, None)
+        self._fav_dump(favs)
+        self._refresh_favs()
+
+    def _refresh_favs(self):
+        self.fav_box.clear_widgets()
+        favs = self._fav_load()
+        if not favs:
+            self.fav_box.add_widget(lbl("Aún no hay favoritos.", 13, MUTED, size_hint_y=None, height=dp(30)))
+        for name in favs:
+            row = BoxLayout(size_hint_y=None, height=dp(42), spacing=dp(6))
+            use = RBtn(text=name)
+            use.bind(on_release=partial(self._fav_use, name))
+            rm = RBtn(text="Borrar", fg=MUTED, size_hint_x=None, width=dp(78))
+            rm.bind(on_release=partial(self._fav_del, name))
+            row.add_widget(use)
+            row.add_widget(rm)
+            self.fav_box.add_widget(row)
+
+    # --- cambiar la foto de una pieza tocándola
+    def _piece_tap(self, u, v):
+        if not self.t_edit.active or self.working or self.result is None:
+            return
+        info = engine.LAST
+        if not info["centers"]:
+            toast("Este modelo no permite cambiar piezas por separado", 2.5)
+            return
+        W, H = info["size"]
+        x, y = u * W, (1 - v) * H
+        k = min(range(len(info["centers"])),
+                key=lambda i: (info["centers"][i][0] - x) ** 2 + (info["centers"][i][1] - y) ** 2)
+        self.overrides[k] = (info["ids"][k] + 1) % info["P"]
+        self.generate(keep=True)
+
+    # --- guardar o compartir
     def save(self, *_):
         if self.result is None:
             toast("Genera un mosaico primero")
@@ -983,28 +1167,44 @@ class Editor(Screen):
         png = RBtn(text="PNG", bold=True, font_size=sp(16))
         row.add_widget(jpg)
         row.add_widget(png)
-        cancel = RBtn(text="Cancelar", size_hint_y=None, height=dp(44))
-        box.add_widget(row)
-        box.add_widget(cancel)
+        share = RBtn(text="Guardar y compartir…", size_hint_y=None, height=dp(48))
+        cancel = RBtn(text="Cancelar", fg=MUTED, size_hint_y=None, height=dp(44))
+        for w_ in (row, share, cancel):
+            box.add_widget(w_)
         pop = Popup(title="Guardar en la galería", content=box, size_hint=(0.86, None),
-                    height=dp(240), background="", background_color=SURFACE, separator_color=ACCENT)
+                    height=dp(310), background="", background_color=SURFACE, separator_color=ACCENT)
 
-        def choose(fmt, *_):
+        def choose(*_, fmt="jpg", share=False):
             pop.dismiss()
-            self._export(fmt)
+            self._export(fmt, share)
 
-        jpg.bind(on_release=partial(choose, "jpg"))
-        png.bind(on_release=partial(choose, "png"))
+        jpg.bind(on_release=partial(choose, fmt="jpg"))
+        png.bind(on_release=partial(choose, fmt="png"))
+        share.bind(on_release=partial(choose, fmt="jpg", share=True))
         cancel.bind(on_release=pop.dismiss)
         pop.open()
 
-    def _export(self, fmt):
+    def _export(self, fmt, share=False):
         toast("Guardando…", 1.2)
-        threading.Thread(target=self._save_worker, args=(self.result, fmt), daemon=True).start()
+        threading.Thread(target=self._save_worker, args=(self.result, fmt, share, self.t_brand.active),
+                         daemon=True).start()
 
-    def _save_worker(self, img, fmt):
-        ok, msg = save_to_gallery(img, unique_name(), fmt)
+    def _save_worker(self, img, fmt, share, brand):
+        if brand:
+            img = engine.add_brand(img.copy(), BRAND)
+        ok, msg, uri = save_to_gallery(img, unique_name(), fmt)
+        if ok and share:
+            if uri is not None:
+                Clock.schedule_once(lambda _dt: self._share(uri, fmt))
+                return
+            msg += ". Compartir directo requiere Android 10 o superior"
         Clock.schedule_once(lambda _dt: toast(msg, 3.2))
+
+    def _share(self, uri, fmt):
+        try:
+            share_image(uri, fmt)
+        except Exception as e:
+            toast(f"No se pudo abrir Compartir: {str(e)[:50]}", 3)
 
 
 # ------------------------------------------------------------------ app

@@ -1,13 +1,17 @@
 """Motor de mosaicos: solo PIL (sin OpenCV, sin Kivy). Todo en RGB."""
+import colorsys
 import heapq
 import math
 import random
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageOps
 
 SHAPES = ["Diamante", "Círculo", "Cuadrado", "Hexágono", "Triángulo", "Estrella", "Cruz"]
 STYLES = SHAPES + ["Mixto", "Collage", "Grid 3x3", "Red de diamantes",
                    "Polaroid", "Muro", "Héroe", "Diagonal", "Corazón", "Rueda", "Anillos",
-                   "Película", "Vitral", "Foto-mosaico"]
+                   "Película", "Vitral", "Foto-mosaico",
+                   "Áureo", "Bento", "Pirámide", "Cuadro", "Ladrillo", "Persianas", "Abanico",
+                   "Burbujas", "Círculos", "Flor", "Carrusel", "Arcos", "Cabina", "Tablero",
+                   "Horizonte", "Chevron", "Olas", "Gema", "Mondrian", "Marcos"]
 
 ASPECTS = {
     "16:9": (1920, 1080), "9:16": (1080, 1920), "1:1": (1500, 1500),
@@ -16,6 +20,12 @@ ASPECTS = {
 }
 
 MAX_TILES = 2500  # tope de seguridad para no congelar el móvil
+
+FX = ["Ninguno", "Blanco y negro", "Sepia", "Vivo"]
+BORDERS = ["Sólido", "Arcoíris", "Por pieza", "Degradado"]
+_BORD = {"mode": "Sólido", "w": 1, "h": 1}   # modo de borde de la render en curso
+_OVR = {}                                     # {n.º de pieza: foto} elegidas a mano
+LAST = {"centers": [], "ids": [], "P": 0, "size": (1, 1)}   # reparto de la última render
 
 
 def load_image(path, max_side=1600):
@@ -59,6 +69,19 @@ def shape_points(shape, cx, cy, s, angle=0.0):
     return [(cx + x * ca - y * sa, cy + x * sa + y * ca) for x, y in p]
 
 
+def _bcol(cx, cy, bc):
+    """Color del borde de una pieza según el modo: sólido, arcoíris, por pieza o degradado."""
+    m = _BORD["mode"]
+    if m == "Sólido":
+        return bc
+    if m == "Degradado":
+        k = max(0.0, min(1.0, (cx / _BORD["w"] + cy / _BORD["h"]) / 2))
+        return tuple(int(a + (255 - a - a) * k) for a in bc)
+    hue = (cx / _BORD["w"] * 0.6 + cy / _BORD["h"] * 0.4) % 1.0 if m == "Arcoíris" \
+        else random.Random(int(cx) * 73856093 ^ int(cy) * 19349663).random()
+    return tuple(int(255 * v) for v in colorsys.hsv_to_rgb(hue, 0.85, 1.0))
+
+
 def paste_poly(canvas, img, pts, bt, bc):
     """Pega la foto recortada con la forma del polígono y un borde de grosor bt."""
     xs, ys = [p[0] for p in pts], [p[1] for p in pts]
@@ -72,7 +95,7 @@ def paste_poly(canvas, img, pts, bt, bc):
     d = ImageDraw.Draw(mask)
     d.polygon(loc, fill=255)
     if bt > 0:
-        canvas.paste(bc, (x0, y0, x1, y1), mask)               # relleno de borde
+        canvas.paste(_bcol(sum(xs) / len(xs), sum(ys) / len(ys), bc), (x0, y0, x1, y1), mask)  # relleno de borde
         d.line(loc + [loc[0]], fill=0, width=bt * 2 + 1, joint="curve")  # erosiona hacia dentro (+1: sin píxeles sueltos)
     bb = mask.getbbox()
     if not bb:
@@ -185,6 +208,10 @@ def _assign(imgs, centers, cell, shuffle, adj=None):
                 moved += 1
         if not moved:
             break
+    for k, p in _OVR.items():                # fotos elegidas a mano para una pieza
+        if 0 <= k < N and 0 <= p < P:
+            ids[k] = p
+    LAST.update(centers=list(centers), ids=list(ids), P=P)
     return [imgs[i] for i in ids]
 
 
@@ -366,7 +393,10 @@ def _rect_cells(w, h, imgs, bc, rects, bt, shuffle):
     canvas = Image.new("RGB", (w, h), bc)
     cells = [(x, y, rw, rh) for x, y, rw, rh in rects if rw - bt * 2 >= 2 and rh - bt * 2 >= 2]
     picks = _assign(imgs, [(x + rw / 2, y + rh / 2) for x, y, rw, rh in cells], max(w, h) / 8, shuffle)
+    d = ImageDraw.Draw(canvas)
     for (x, y, rw, rh), im in zip(cells, picks):
+        if bt > 0 and _BORD["mode"] != "Sólido":
+            d.rectangle((x, y, x + rw - 1, y + rh - 1), fill=_bcol(x + rw / 2, y + rh / 2, bc))
         canvas.paste(powerclip(im, rw - bt * 2, rh - bt * 2), (x + bt, y + bt))
     return canvas
 
@@ -720,7 +750,349 @@ COLLAGES = {"Polaroid": render_polaroid, "Muro": render_muro, "Héroe": render_h
             "Foto-mosaico": render_photomosaic}
 
 
-def render(style, w, h, imgs, s, bt, bc, rng=0.12, rot=0, rot_random=False, shuffle=True, seed=None):
+# ---------------------------------------------------------------- 20 collages creativos más
+# Misma regla: ninguna foto se superpone ni se toca (separación mínima _gap()).
+def _spans(total, n, weights=None):
+    weights = weights or [1.0] * n
+    tot, pos, out = sum(weights), 0.0, [0]
+    for wt in weights:
+        pos += total * wt / tot
+        out.append(int(round(pos)))
+    return out
+
+
+def _pack(xs, ys):
+    """Une celdas contiguas de una rejilla (1x1, 2x1, 1x2, 2x2) al azar, sin dejar huecos."""
+    nx, ny = len(xs) - 1, len(ys) - 1
+    used = [[False] * nx for _ in range(ny)]
+    rects = []
+    for r in range(ny):
+        for c in range(nx):
+            if used[r][c]:
+                continue
+            opts = [(1, 1)]
+            for (dc, dr), p in (((2, 2), 0.16), ((2, 1), 0.28), ((1, 2), 0.28)):
+                if c + dc <= nx and r + dr <= ny and random.random() < p and \
+                        all(not used[r + i][c + j] for i in range(dr) for j in range(dc)):
+                    opts.append((dc, dr))
+            dc, dr = random.choice(opts[1:] or opts)
+            for i in range(dr):
+                for j in range(dc):
+                    used[r + i][c + j] = True
+            rects.append((xs[c], ys[r], xs[c + dc] - xs[c], ys[r + dr] - ys[r]))
+    return rects
+
+
+def _shapes_collage(w, h, imgs, polys, bt, bc, shuffle, cell):
+    """Formas sueltas (ya separadas por construcción), sin recorte extra."""
+    canvas = Image.new("RGB", (w, h), bc)
+    polys = [p for p in polys if len(p) >= 3 and _visible(p, w, h)]
+    picks = _assign(imgs, [_center(p) for p in polys], cell, shuffle)
+    for pts, im in zip(polys, picks):
+        paste_poly(canvas, im, pts, int(bt), bc)
+    return canvas
+
+
+def render_golden(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    rects, x, y, rw, rh, flip = [], 0, 0, w, h, random.random() < 0.5
+    stop = max(70, s * 0.3)
+    while min(rw, rh) > stop and len(rects) < 14:
+        if rw >= rh:
+            sq = rh
+            rects.append((x, y, sq, rh) if flip else (x + rw - sq, y, sq, rh))
+            x, rw = (x + sq if flip else x), rw - sq
+        else:
+            sq = rw
+            rects.append((x, y, rw, sq) if flip else (x, y + rh - sq, rw, sq))
+            y, rh = (y + sq if flip else y), rh - sq
+        flip = not flip
+    rects.append((x, y, rw, rh))
+    return _rect_collage(w, h, imgs, rects, bt, bc, shuffle)
+
+
+def render_bento(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    cols, rows = max(3, min(6, round(w / (s * 0.8)))), max(3, min(6, round(h / (s * 0.8))))
+    return _rect_collage(w, h, imgs, _pack(_spans(w, cols), _spans(h, rows)), bt, bc, shuffle)
+
+
+def render_pyramid(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    rows = max(2, min(7, round(h / (s * 0.6))))
+    ys, pw, flip = _spans(h, rows), w // rows, random.random() < 0.5
+    rects = []
+    for i in range(rows):
+        n = rows - i if flip else i + 1
+        x0 = (w - n * pw) // 2
+        rects += [(x0 + j * pw, ys[i], pw, ys[i + 1] - ys[i]) for j in range(n)]
+    return _rect_collage(w, h, imgs, rects, bt, bc, shuffle)
+
+
+def render_centerpiece(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    t = int(min(w, h) * 0.2)
+    rects = [(t, t, w - 2 * t, h - 2 * t)]
+    xs, ys = _spans(w, max(2, round(w / (t * 1.4)))), _spans(h - 2 * t, max(1, round((h - 2 * t) / (t * 1.4))))
+    for i in range(len(xs) - 1):
+        rects += [(xs[i], 0, xs[i + 1] - xs[i], t), (xs[i], h - t, xs[i + 1] - xs[i], t)]
+    for i in range(len(ys) - 1):
+        rects += [(0, t + ys[i], t, ys[i + 1] - ys[i]), (w - t, t + ys[i], t, ys[i + 1] - ys[i])]
+    return _rect_collage(w, h, imgs, rects, bt, bc, shuffle)
+
+
+def render_brick(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    hb = max(80, s * 0.45)
+    rows = max(2, round(h / hb))
+    n = max(2, round(w / (hb * 1.9)))
+    ys, cw, rects = _spans(h, rows), w / n, []
+    for r in range(rows):
+        if r % 2 == 0:
+            edges = [int(round(k * cw)) for k in range(n + 1)]
+        else:
+            edges = [0] + [int(round((k + 0.5) * cw)) for k in range(n)] + [w]
+        rects += [(edges[i], ys[r], edges[i + 1] - edges[i], ys[r + 1] - ys[r]) for i in range(len(edges) - 1)]
+    return _rect_collage(w, h, imgs, rects, bt, bc, shuffle)
+
+
+def render_blinds(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    vertical = w >= h
+    L = w if vertical else h
+    n = max(4, min(30, round(L / (s * 0.35))))
+    b = _spans(L, n, [random.uniform(0.5, 1.6) for _ in range(n)])
+    rects = [(b[i], 0, b[i + 1] - b[i], h) for i in range(n)] if vertical \
+        else [(0, b[i], w, b[i + 1] - b[i]) for i in range(n)]
+    return _rect_collage(w, h, imgs, rects, bt, bc, shuffle)
+
+
+def render_fan(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    cx, cy, R = w / 2, h, math.hypot(w / 2, h) + 4
+    n = max(5, min(12, round(w / (s * 0.5))))
+    polys = [_sector(cx, cy, 0, R, math.pi + math.pi * i / n, math.pi + math.pi * (i + 1) / n) for i in range(n)]
+    return _poly_collage(w, h, imgs, polys, bt, bc, shuffle, min(w, h) / 4)
+
+
+def render_bubbles(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    g = _gap(w, h, bt)
+    rmax = max(40, min(min(w, h) * 0.24, s * 0.55))
+    rmin, circles, r = max(18, rmax * 0.2), [], rmax
+    while r >= rmin and len(circles) < 90:
+        fails = 0
+        while fails < 80 and len(circles) < 90:
+            x, y = random.uniform(r + g, w - r - g), random.uniform(r + g, h - r - g)
+            if all(math.hypot(x - cx, y - cy) >= r + cr + g + 1 for cx, cy, cr in circles):
+                circles.append((x, y, r))
+                fails = 0
+            else:
+                fails += 1
+        r *= 0.9
+    return _shapes_collage(w, h, imgs, [_disc(x, y, r) for x, y, r in circles], bt, bc, shuffle, rmax * 1.5)
+
+
+def render_circles(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    g, cell = _gap(w, h, bt), max(120, s * 0.7)
+    xs, ys = _spans(w, max(2, round(w / cell))), _spans(h, max(1, round(h / cell)))
+    polys = []
+    for r in range(len(ys) - 1):
+        for c in range(len(xs) - 1):
+            cw, ch = xs[c + 1] - xs[c], ys[r + 1] - ys[r]
+            polys.append(_disc(xs[c] + cw / 2, ys[r] + ch / 2, (min(cw, ch) - g - 1) / 2))
+    return _shapes_collage(w, h, imgs, polys, bt, bc, shuffle, cell)
+
+
+def render_flower(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    g, cx, cy, mn = _gap(w, h, bt), w / 2, h / 2, min(w, h)
+    n = max(6, min(12, round(mn / (s * 0.45))))
+    d, a = 0.31 * mn, 0.16 * mn
+    b = max(8, 0.36 * 2 * d * math.sin(math.pi / n) - g)
+    a0 = math.radians(rot + (random.uniform(0, 360) if rot_random else 0))
+    polys = [_disc(cx, cy, max(10, d - a - 1.5 * g))]
+    for i in range(n):
+        th = a0 + math.tau * i / n
+        ct, st = math.cos(th), math.sin(th)
+        polys.append([(cx + (d + a * math.cos(ph)) * ct - b * math.sin(ph) * st,
+                       cy + (d + a * math.cos(ph)) * st + b * math.sin(ph) * ct)
+                      for ph in (math.tau * k / 40 for k in range(40))])
+    return _shapes_collage(w, h, imgs, polys, bt, bc, shuffle, mn / 4)
+
+
+def render_carousel(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    g, cx, cy, mn = _gap(w, h, bt), w / 2, h / 2, min(w, h)
+    n = max(6, min(14, round(mn / (s * 0.32))))
+    sn = math.sin(math.pi / n)
+    Rc = (0.49 * mn + g / 2) / (1 + sn)
+    q = (2 * Rc * sn - g) / 1.4143
+    a0 = math.radians(rot + (random.uniform(0, 360) if rot_random else 0))
+    polys = [_disc(cx, cy, max(10, Rc * (1 - sn) - 0.7 * g))]
+    for i in range(n):
+        th = a0 + math.tau * i / n
+        px, py, ct, st = cx + Rc * math.cos(th), cy + Rc * math.sin(th), math.cos(th), math.sin(th)
+        polys.append([(px + u * ct - v * st, py + u * st + v * ct)
+                      for u, v in ((-q / 2, -q / 2), (q / 2, -q / 2), (q / 2, q / 2), (-q / 2, q / 2))])
+    return _shapes_collage(w, h, imgs, polys, bt, bc, shuffle, mn / 4)
+
+
+def render_arches(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    g = _gap(w, h, bt)
+    xs = _spans(w, max(2, min(8, round(w / (s * 0.8)))))
+    ys = _spans(h, max(1, min(4, round(h / (s * 1.1)))))
+    polys = []
+    for r in range(len(ys) - 1):
+        for c in range(len(xs) - 1):
+            ah = ys[r + 1] - ys[r] - g
+            aw = min(xs[c + 1] - xs[c] - g, ah * 1.6)
+            if aw < 24 or ah < 24:
+                continue
+            x, y = xs[c] + (xs[c + 1] - xs[c] - aw) / 2, ys[r] + g / 2
+            rad = aw / 2
+            polys.append([(x, y + ah), (x, y + rad)]
+                         + [(x + rad - rad * math.cos(math.pi * i / 24), y + rad - rad * math.sin(math.pi * i / 24))
+                            for i in range(1, 24)] + [(x + aw, y + rad), (x + aw, y + ah)])
+    return _shapes_collage(w, h, imgs, polys, bt, bc, shuffle, s * 0.8)
+
+
+def render_booth(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    g = _gap(w, h, bt)
+    n = max(2, min(5, round(w / (s * 0.9))))
+    gs = max(g, int(0.03 * w))
+    sw, sh = (w - (n + 1) * gs) // n, h - 2 * gs
+    pad = max(g, int(sw * 0.07))
+    k = max(3, min(6, round(sh / (sw * 0.85))))
+    pw, ph = sw - 2 * pad, (sh - (k + 1) * pad) // k
+    canvas = Image.new("RGB", (w, h), bc)
+    d, frames = ImageDraw.Draw(canvas), []
+    for i in range(n):
+        x = gs + i * (sw + gs)
+        d.rectangle((x, gs, x + sw - 1, gs + sh - 1), fill=POLAROID_FRAME)
+        frames += [(x + pad, gs + pad + j * (ph + pad), pw, ph) for j in range(k)]
+    picks = _assign(imgs, [(x + pw / 2, y + ph / 2) for x, y, _, _ in frames], max(w, h) / 6, shuffle)
+    for (x, y, fw, fh), im in zip(frames, picks):
+        canvas.paste(powerclip(im, fw, fh), (x, y))
+    return canvas
+
+
+def render_checker(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    cell = max(90, s * 0.6)
+    xs, ys = _spans(w, max(2, round(w / cell))), _spans(h, max(2, round(h / cell)))
+    par = random.randint(0, 1)
+    rects = [(xs[c], ys[r], xs[c + 1] - xs[c], ys[r + 1] - ys[r])
+             for r in range(len(ys) - 1) for c in range(len(xs) - 1) if (r + c) % 2 == par]
+    return _rect_collage(w, h, imgs, rects, bt, bc, shuffle)
+
+
+def render_skyline(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    n = max(5, min(18, round(w / (s * 0.4))))
+    xs, rects = _spans(w, n), []
+    for i in range(n):
+        bh = int(h * random.uniform(0.38, 0.97))
+        x, bw = xs[i], xs[i + 1] - xs[i]
+        if bh > 0.62 * h:
+            top = int(bh * 0.55)
+            rects += [(x, h - bh, bw, top), (x, h - bh + top, bw, bh - top)]
+        else:
+            rects.append((x, h - bh, bw, bh))
+    return _rect_collage(w, h, imgs, rects, bt, bc, shuffle)
+
+
+def _bands(w, h, n, f, amp, samples):
+    """Franjas entre curvas paralelas y = j*alto + f(x): comparten el borde exacto."""
+    bh = (h + 2 * amp + 4) / n
+    xs = [w * i / samples for i in range(samples + 1)]
+    line = lambda j: [(x, -amp - 2 + j * bh + f(x)) for x in xs]
+    return [line(j) + line(j + 1)[::-1] for j in range(n)]
+
+
+def render_chevron(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    amp = 0.25 * h
+    polys = _bands(w, h, max(4, min(14, round(h / (s * 0.5)))), lambda x: amp * abs(x - w / 2) / (w / 2), amp, 2)
+    return _poly_collage(w, h, imgs, polys, bt, bc, shuffle, s * 0.6)
+
+
+def render_waves(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    amp = 0.06 * h
+    polys = _bands(w, h, max(4, min(14, round(h / (s * 0.5)))), lambda x: amp * math.sin(math.tau * 2 * x / w), amp, 48)
+    return _poly_collage(w, h, imgs, polys, bt, bc, shuffle, s * 0.6)
+
+
+def render_gem(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    cx, cy, mn = w / 2, h / 2, min(w, h)
+    r2 = 0.47 * mn
+    r1 = 0.5 * r2
+    a0 = math.radians(rot + (random.uniform(0, 60) if rot_random else 0))
+    P = [(cx + r1 * math.cos(a0 + math.pi / 3 * i), cy + r1 * math.sin(a0 + math.pi / 3 * i)) for i in range(6)]
+    Q = [(cx + r2 * math.cos(a0 + math.pi / 3 * i + math.pi / 6), cy + r2 * math.sin(a0 + math.pi / 3 * i + math.pi / 6))
+         for i in range(6)]
+    polys = [[(cx, cy), P[i], P[(i + 1) % 6]] for i in range(6)]
+    polys += [[P[i], P[(i + 1) % 6], Q[i]] for i in range(6)]
+    polys += [[Q[i - 1], Q[i], P[i]] for i in range(6)]
+    return _poly_collage(w, h, imgs, polys, bt, bc, shuffle, mn / 5)
+
+
+def render_mondrian(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    def cuts(total, k):
+        for _ in range(60):
+            pts = sorted(random.uniform(0.12, 0.88) for _ in range(k))
+            if all(b - a >= 0.14 for a, b in zip([0] + pts, pts + [1])):
+                break
+        return [0] + [int(p * total) for p in pts] + [total]
+    xs, ys = cuts(w, random.randint(3, 5)), cuts(h, random.randint(2, 3))
+    return _rect_collage(w, h, imgs, _pack(xs, ys), bt, bc, shuffle)
+
+
+def render_nested(w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle):
+    t = max(80, int(min(w, h) * 0.17))
+    rects, x, y, rw, rh = [], 0, 0, w, h
+    for _ in range(2):
+        if rw <= 2 * t + 80 or rh <= 2 * t + 80:
+            break
+        xs, ys = _spans(rw, max(2, round(rw / (t * 1.5)))), _spans(rh - 2 * t, max(1, round((rh - 2 * t) / (t * 1.5))))
+        for i in range(len(xs) - 1):
+            rects += [(x + xs[i], y, xs[i + 1] - xs[i], t), (x + xs[i], y + rh - t, xs[i + 1] - xs[i], t)]
+        for i in range(len(ys) - 1):
+            rects += [(x, y + t + ys[i], t, ys[i + 1] - ys[i]), (x + rw - t, y + t + ys[i], t, ys[i + 1] - ys[i])]
+        x, y, rw, rh = x + t, y + t, rw - 2 * t, rh - 2 * t
+    rects.append((x, y, rw, rh))
+    return _rect_collage(w, h, imgs, rects, bt, bc, shuffle)
+
+
+COLLAGES.update({"Áureo": render_golden, "Bento": render_bento, "Pirámide": render_pyramid,
+                 "Cuadro": render_centerpiece, "Ladrillo": render_brick, "Persianas": render_blinds,
+                 "Abanico": render_fan, "Burbujas": render_bubbles, "Círculos": render_circles,
+                 "Flor": render_flower, "Carrusel": render_carousel, "Arcos": render_arches,
+                 "Cabina": render_booth, "Tablero": render_checker, "Horizonte": render_skyline,
+                 "Chevron": render_chevron, "Olas": render_waves, "Gema": render_gem,
+                 "Mondrian": render_mondrian, "Marcos": render_nested})
+
+
+# ---------------------------------------------------------------- filtros, marca y render final
+def apply_fx(im, fx, bright=1.0, contrast=1.0):
+    if fx == "Blanco y negro":
+        im = ImageOps.grayscale(im).convert("RGB")
+    elif fx == "Sepia":
+        im = ImageOps.colorize(ImageOps.grayscale(im), (28, 16, 6), (255, 238, 205))
+    elif fx == "Vivo":
+        im = ImageEnhance.Contrast(ImageEnhance.Color(im).enhance(1.6)).enhance(1.1)
+    if bright != 1.0:
+        im = ImageEnhance.Brightness(im).enhance(bright)
+    if contrast != 1.0:
+        im = ImageEnhance.Contrast(im).enhance(contrast)
+    return im
+
+
+def add_brand(img, logo_path, opacity=0.6, rel_width=0.17):
+    """Marca PHAIZERX en la esquina inferior derecha, con sombra suave para que se lea sobre cualquier fondo."""
+    try:
+        logo = Image.open(logo_path).convert("RGBA")
+    except Exception:
+        return img
+    w, h = img.size
+    lw = max(40, int(w * rel_width))
+    logo = logo.resize((lw, max(1, round(logo.height * lw / logo.width))), Image.LANCZOS)
+    alpha = logo.getchannel("A").point(lambda v: int(v * opacity))
+    x, y = w - lw - int(w * 0.02), h - logo.height - int(h * 0.02)
+    shadow = alpha.point(lambda v: int(v * 0.6))
+    img.paste(Image.new("RGB", logo.size, (0, 0, 0)), (x + 2, y + 2), shadow)
+    img.paste(logo.convert("RGB"), (x, y), alpha)
+    return img
+
+
+def _render_core(style, w, h, imgs, s, bt, bc, rng=0.12, rot=0, rot_random=False, shuffle=True, seed=None):
     if seed is not None:
         random.seed(seed)  # mismo seed = mismo diseño
     if style in COLLAGES:
@@ -732,3 +1104,16 @@ def render(style, w, h, imgs, s, bt, bc, rng=0.12, rot=0, rot_random=False, shuf
     if style == "Red de diamantes":
         return render_diamond_network(w, h, imgs, s, bt, bc, shuffle)
     return render_tiles(w, h, imgs, style, s, bt, bc, rng, rot, rot_random, shuffle)
+
+
+def render(style, w, h, imgs, s, bt, bc, rng=0.12, rot=0, rot_random=False, shuffle=True, seed=None,
+           border="Sólido", fx="Ninguno", bright=1.0, contrast=1.0, overrides=None):
+    """border: modo del borde (BORDERS). fx/bright/contrast: filtro de fotos (no toca el color del borde).
+    overrides: {n.º de pieza: n.º de foto} para cambiar a mano la foto de una pieza."""
+    _BORD.update(mode=border, w=max(1, w), h=max(1, h))
+    _OVR.clear()
+    _OVR.update(overrides or {})
+    LAST.update(centers=[], ids=[], P=0, size=(w, h))
+    if fx != "Ninguno" or bright != 1.0 or contrast != 1.0:
+        imgs = [apply_fx(im, fx, bright, contrast) for im in imgs]
+    return _render_core(style, w, h, imgs, s, bt, bc, rng, rot, rot_random, shuffle, seed)

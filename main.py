@@ -205,7 +205,48 @@ def lbl(text="", size=14, color=TEXT, halign="left", bold=False, **kw):
     return w
 
 
-class RBtn(ButtonBehavior, Label):
+class TapGuard:
+    """Evita pulsaciones fantasma en listas con scroll: si el dedo se desplazó (era un gesto de
+    deslizar) o la lista iba en movimiento al tocarla, soltar sobre un botón NO cuenta como pulsación."""
+
+    def on_touch_down(self, touch):
+        if self.collide_point(*touch.pos):
+            touch.ud["tg%d" % id(self)] = (touch.sx, touch.sy)   # coordenadas de pantalla: no cambian al hacer scroll
+        return super().on_touch_down(touch)
+
+    def on_touch_up(self, touch):
+        start = touch.ud.get("tg%d" % id(self))
+        if start is not None and touch.grab_current is self:
+            moved = math.hypot((touch.sx - start[0]) * Window.width, (touch.sy - start[1]) * Window.height)
+            if moved > dp(12) or touch.ud.get("scroll_moving"):
+                touch.ungrab(self)
+                if hasattr(self, "state"):
+                    self.state = "normal"
+                return True
+        return super().on_touch_up(touch)
+
+
+class SteadyScroll(ScrollView):
+    """ScrollView que no confunde un deslizamiento lento con una pulsación (el de Kivy espera solo
+    55 ms) y que avisa a los botones si la lista iba en movimiento cuando se la tocó."""
+
+    def __init__(self, **kw):
+        kw.setdefault("scroll_timeout", 250)
+        kw.setdefault("scroll_distance", dp(6))
+        kw.setdefault("bar_width", dp(5))
+        kw.setdefault("bar_color", (ACCENT[0], ACCENT[1], ACCENT[2], 0.9))
+        kw.setdefault("bar_inactive_color", (ACCENT[0], ACCENT[1], ACCENT[2], 0.35))
+        kw.setdefault("scroll_type", ["bars", "content"])
+        super().__init__(**kw)
+
+    def on_touch_down(self, touch):
+        if self.collide_point(*touch.pos):
+            eff = getattr(self, "effect_y", None)
+            touch.ud["scroll_moving"] = bool(eff is not None and abs(eff.velocity) > dp(30))
+        return super().on_touch_down(touch)
+
+
+class RBtn(TapGuard, ButtonBehavior, Label):
     """Botón redondeado con feedback al pulsar."""
 
     def __init__(self, bg=SURFACE2, fg=TEXT, radius=14, **kw):
@@ -257,6 +298,40 @@ class ChipGroup:
             c.set_colors(*((ACCENT, WHITE) if o == self.value else (SURFACE2, TEXT)))
 
 
+class SectionedChips:
+    """Chips de selección única repartidos en secciones con título: mucho más fácil de recorrer."""
+
+    def __init__(self, groups, default, on_change=None, cols=3, height=44):
+        self.value, self.on_change, self.chips = default, on_change, {}
+        self.widget = BoxLayout(orientation="vertical", size_hint_y=None, spacing=dp(6))
+        self.widget.bind(minimum_height=self.widget.setter("height"))
+        self.current = lbl("", 13, TEXT, bold=True, size_hint_y=None, height=dp(28))
+        self.widget.add_widget(self.current)
+        for title, options in groups.items():
+            self.widget.add_widget(lbl(title, 12, MUTED, size_hint_y=None, height=dp(24)))
+            grid = GridLayout(cols=cols, spacing=dp(8), size_hint_y=None,
+                              row_default_height=dp(height), row_force_default=True)
+            grid.bind(minimum_height=grid.setter("height"))
+            for o in options:
+                c = RBtn(text=o, font_size=sp(12), radius=12)
+                c.bind(on_release=lambda _b, o=o: self.select(o))
+                self.chips[o] = c
+                grid.add_widget(c)
+            self.widget.add_widget(grid)
+        self._paint()
+
+    def select(self, o, notify=True):
+        self.value = o
+        self._paint()
+        if notify and self.on_change:
+            self.on_change(o)
+
+    def _paint(self):
+        self.current.text = f"Estilo elegido: {self.value}"
+        for o, c in self.chips.items():
+            c.set_colors(*((ACCENT, WHITE) if o == self.value else (SURFACE2, TEXT)))
+
+
 class Toggle(RBtn):
     def __init__(self, text, active=False, **kw):
         super().__init__(text=text, radius=12, **kw)
@@ -300,7 +375,8 @@ class AppBar(BoxLayout):
         elif os.path.exists(LOGO):
             self.add_widget(Image(source=LOGO, size_hint=(None, None), size=(dp(40), dp(40)),
                                   pos_hint={"center_y": 0.5}))
-        self.add_widget(lbl(title, 20, TEXT, bold=True))
+        self.title_lbl = lbl(title, 20, TEXT, bold=True)
+        self.add_widget(self.title_lbl)
         if right:
             self.add_widget(right)
 
@@ -467,7 +543,7 @@ class PhotoView(Widget):
         return False
 
 
-class HistThumb(ButtonBehavior, Image):
+class HistThumb(TapGuard, ButtonBehavior, Image):
     def __init__(self, entry, **kw):
         super().__init__(**kw)
         self.entry = entry
@@ -475,7 +551,7 @@ class HistThumb(ButtonBehavior, Image):
 
 
 # ------------------------------------------------------------------ galería
-class Thumb(ButtonBehavior, FloatLayout):
+class Thumb(TapGuard, ButtonBehavior, FloatLayout):
     def __init__(self, path, **kw):
         super().__init__(size_hint_y=None, **kw)
         self.path = path
@@ -542,7 +618,7 @@ class Gallery(Screen):
         root.add_widget(self.sub)
 
         body = FloatLayout()
-        sv = ScrollView(size_hint=(1, 1))
+        sv = SteadyScroll(size_hint=(1, 1))
         self.grid = GridLayout(cols=3, spacing=dp(6), padding=dp(10), size_hint_y=None)
         self.grid.bind(minimum_height=self.grid.setter("height"), width=self._cell)
         sv.add_widget(self.grid)
@@ -705,6 +781,7 @@ class Editor(Screen):
         super().__init__(**kw)
         self.imgs, self.result, self.working, self.seed = [], None, False, None
         self.overrides, self.history = {}, []
+        self._scroll_pos, self._tab_name = {}, None
         self.bc = (255, 255, 255)
         self.busy = Busy()
         self.clean, self.sheet_open = False, True
@@ -736,6 +813,7 @@ class Editor(Screen):
         self.appbar = AppBar("Editor", left=back, right=right)
         self.add_widget(self.appbar)
 
+        self._style_title()
         self.exit_btn = RBtn(text="Volver al editor", bg=(0.1, 0.11, 0.15, 0.85),
                              size_hint=(None, None), size=(dp(150), dp(40)))
         self.exit_btn.bind(on_release=self.exit_clean_mode)
@@ -775,8 +853,23 @@ class Editor(Screen):
         self.pv.inset_top = max(0, self.height - self.appbar.y)
 
     def _style_hint(self, name):
+        self._style_title()
         if name == "Foto-mosaico":
             toast("Se reconstruye la PRIMERA foto con las demás", 3.2)
+
+    def _style_title(self):
+        """El estilo elegido se ve siempre en la barra superior, aunque la lista esté desplazada."""
+        bar = getattr(self, "appbar", None)
+        if bar is not None:
+            bar.title_lbl.font_size = sp(15)
+            bar.title_lbl.text = f"Editor · {self.style.value}"
+
+    def _reveal_style(self, *_):
+        try:
+            if self._tab_name == "Estilo":
+                self.sv.scroll_to(self.style.chips[self.style.value], padding=dp(70), animate=False)
+        except Exception:
+            pass
 
     def toggle_sheet(self, *_):
         if self.clean:
@@ -815,10 +908,10 @@ class Editor(Screen):
                          padding=(dp(14), 0, dp(14), dp(10)), spacing=dp(10))
         self.tabs = ChipGroup(["Estilo", "Ajustes", "Formato", "Extras"], "Estilo", self._tab, cols=4, height=38)
         body.add_widget(self.tabs.widget)
-        self.sv = ScrollView(do_scroll_x=False)
+        self.sv = SteadyScroll(do_scroll_x=False)
         body.add_widget(self.sv)
 
-        self.style = ChipGroup(engine.STYLES, "Diamante", self._style_hint, cols=3)
+        self.style = SectionedChips(engine.STYLE_GROUPS, "Diamante", self._style_hint)
         self.aspect = ChipGroup(list(engine.ASPECTS) + ["Original"], "16:9", cols=3)
         self.page_style = self._wrap(self.style.widget)
         self.page_aspect = self._wrap(self.aspect.widget)
@@ -899,9 +992,16 @@ class Editor(Screen):
     def _tab(self, name):
         page = {"Estilo": self.page_style, "Ajustes": self.page_adjust, "Formato": self.page_aspect,
                 "Extras": self.page_extra}[name]
+        if self._tab_name:                       # recuerda hasta dónde habías bajado en cada pestaña
+            self._scroll_pos[self._tab_name] = self.sv.scroll_y
+        self._tab_name = name
         self.sv.clear_widgets()
         self.sv.add_widget(page)
-        self.sv.scroll_y = 1
+        if name == "Estilo":
+            self.sv.scroll_y = 1
+            Clock.schedule_once(self._reveal_style, 0.08)   # deja a la vista el estilo elegido
+        else:
+            self.sv.scroll_y = self._scroll_pos.get(name, 1)
 
     # --- color
     def set_color(self, c):
@@ -1056,6 +1156,8 @@ class Editor(Screen):
             self.t_brand._paint()
         except Exception:
             pass
+        self._style_title()
+        Clock.schedule_once(self._reveal_style, 0.1)
 
     # --- historial: los últimos 8 mosaicos de estas fotos
     def _refresh_history(self):
@@ -1081,6 +1183,8 @@ class Editor(Screen):
         self.fx.select(a["fx"], False)
         self.s_bright.slider.value, self.s_contrast.slider.value = a["bright"], a["contrast"]
         self.seed, self.overrides = a["seed"], dict(a["overrides"])
+        self._style_title()
+        Clock.schedule_once(self._reveal_style, 0.1)
         self.generate(keep=True)        # mismo diseño exacto: la semilla lo reproduce
 
     # --- favoritos con nombre

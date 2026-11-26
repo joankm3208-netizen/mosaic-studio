@@ -12,6 +12,15 @@ STYLES = SHAPES + ["Mixto", "Collage", "Grid 3x3", "Red de diamantes",
                    "Áureo", "Bento", "Pirámide", "Cuadro", "Ladrillo", "Persianas", "Abanico",
                    "Burbujas", "Círculos", "Flor", "Carrusel", "Arcos", "Cabina", "Tablero",
                    "Horizonte", "Chevron", "Olas", "Gema", "Mondrian", "Marcos"]
+STYLE_GROUPS = {
+    "Teselados sin huecos": SHAPES + ["Mixto"],
+    "Collages": ["Collage", "Grid 3x3", "Red de diamantes", "Polaroid", "Muro", "Héroe", "Diagonal",
+                 "Corazón", "Rueda", "Anillos", "Película", "Vitral", "Foto-mosaico"],
+    "Más collages": ["Áureo", "Bento", "Pirámide", "Cuadro", "Ladrillo", "Persianas", "Abanico",
+                     "Burbujas", "Círculos", "Flor", "Carrusel", "Arcos", "Cabina", "Tablero",
+                     "Horizonte", "Chevron", "Olas", "Gema", "Mondrian", "Marcos"],
+}
+assert sum(STYLE_GROUPS.values(), []) == STYLES
 
 ASPECTS = {
     "16:9": (1920, 1080), "9:16": (1080, 1920), "1:1": (1500, 1500),
